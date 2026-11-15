@@ -13,5 +13,4 @@ O endereço do projeto é [Tw0nin3/ravoxbr](https://github.com/Tw0nin3/ravoxbr).
 ## Créditos e licença
 
 - Tw0nin3 é o responsável pelo Ravox BR e por suas alterações.
-- O userscript incorpora código do [Flyt](https://github.com/prvrtl/flyt), de prvrtl. O código foi modificado para o Ravox BR. Revisão deste pacote em 15 de novembro de 2026.
 - O código é distribuído sob GPL-3.0-or-later. Consulte o texto em [LICENSE](LICENSE).
