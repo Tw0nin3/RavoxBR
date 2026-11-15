@@ -17,7 +17,6 @@
 
 // Ravox BR by Tw0nin3
 // Ravox BR source: https://github.com/Tw0nin3/ravoxbr
-// Modified 2026-11-15. Original code attribution: Flyt by prvrtl.
 // License: https://www.gnu.org/licenses/gpl-3.0.html
 
 (() => {
