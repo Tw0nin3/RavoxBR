@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Ravox BR
 // @namespace    vertice.personal
-// @version      3.2.4
+// @version      3.3.0
 // @description  Ravox BR — interface personalizada para o YouTube.
 // @author       Tw0nin3
 // @license      GPL-3.0-or-later
@@ -17,6 +17,7 @@
 
 // Ravox BR by Tw0nin3
 // Ravox BR source: https://github.com/Tw0nin3/ravoxbr
+// Modified 2026-11-20. Original code attribution: Flyt by prvrtl.
 // License: https://www.gnu.org/licenses/gpl-3.0.html
 
 (() => {
@@ -30,7 +31,7 @@
   // and their playback toggles fight — which presents as bugs that "survive"
   // every fix because the old copy is still doing the old thing. The version
   // line also ends the guessing about which build a browser actually runs.
-  const RAVOX_VERSION = (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '3.2.4';
+  const RAVOX_VERSION = (typeof GM_info !== 'undefined' && GM_info?.script?.version) || '3.3.0';
   if (window.__ravoxBooted) {
     console.warn('[Ravox BR] v' + RAVOX_VERSION + ': another copy (v' + window.__ravoxBooted + ') is already running on this page — this one is NOT starting. Remove duplicate userscripts.');
     return;
@@ -38,44 +39,171 @@
   window.__ravoxBooted = RAVOX_VERSION;
   console.info('[Ravox BR] v' + RAVOX_VERSION);
 
-  // Neutralize the player's telemetry at the source: answer these with a
-  // fake success instead of letting them reach the network. Quieter than a
-  // content blocker (the player sees "delivered" and never retries — with a
-  // blocker it fails loudly and keeps trying) and it holds for users without
-  // one. Deliberately NOT blocked: /api/stats/watchtime and playback — they
-  // record watch history and resume positions, which are user-facing
-  // features, not telemetry.
-  const TELEMETRY_URL_RE = /doubleclick\.net\/|googlesyndication\.com\/|googleadservices\.com\/|google-analytics\.com\/|\/api\/stats\/(qoe|atr|ads|delayplay)\b|\/ptracking\b|\/youtubei\/v1\/log_event|\/pagead\//;
-  const origFetch = window.fetch;
-  window.fetch = function (input, init) {
-    try {
-      // fetch takes string | URL | Request. A URL object has no `.url`, only
-      // `.href`, so the old `input.url` read undefined for it and every
-      // fetch(new URL(...)) walked straight past this filter. `'url' in input`
-      // rather than `instanceof Request` because it narrows for the checker and
-      // stays duck-typed, so a Request minted in another realm still matches.
-      const url = typeof input === 'string' ? input
-        : input && 'url' in input ? input.url
-        : input ? String(input) : '';
-      if (TELEMETRY_URL_RE.test(url)) return Promise.resolve(new Response(null, { status: 204 }));
-    } catch (e) {}
-    return origFetch.apply(this, arguments);
-  };
-  if (navigator.sendBeacon) {
-    const origBeacon = navigator.sendBeacon.bind(navigator);
-    navigator.sendBeacon = function (url, data) {
-      try { if (TELEMETRY_URL_RE.test(String(url))) return true; } catch (e) {}
-      return origBeacon(url, data);
-    };
-  }
-
   const lsGet = (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } };
   const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} };
+
+  // Shared lifecycle, request limits and privacy-safe diagnostics.
+  const telemetryEnabled = () => lsGet('ravox-telemetry') !== '0';
+  let restoreNetwork = () => {};
+  const routeRequests = new Set();
+  const issues = [];
+  let latestIssue = null;
+  let recovering = false;
+  const recordIssue = (feature, error) => {
+    // Never serialize cookies, headers, URLs, response bodies or raw exceptions.
+    const kind = error?.name === 'TimeoutError' ? 'timeout'
+      : error?.status === 401 || error?.status === 403 ? 'session'
+        : error?.status === 404 || error?.status === 410 ? 'unavailable'
+          : error?.status ? 'http' : error?.name === 'TypeError' ? 'network' : 'internal';
+    const entry = { feature: String(feature).replace(/[^a-z0-9/_-]/gi, '').slice(0, 60), kind,
+      status: Number.isInteger(error?.status) ? error.status : null, at: new Date().toISOString() };
+    latestIssue = entry;
+    issues.push(entry);
+    if (issues.length > 20) issues.shift();
+    console.warn('[Ravox BR]', entry.feature, entry.kind, entry.status || '');
+    return entry;
+  };
+  const cancelRouteRequests = () => {
+    for (const controller of routeRequests) controller.abort();
+    routeRequests.clear();
+  };
+  const requestJson = async (url, init = {}, options = {}) => {
+    const controller = new AbortController();
+    const parent = options.signal;
+    const cancel = () => controller.abort();
+    let timedOut = false;
+    if (parent?.aborted) controller.abort();
+    else parent?.addEventListener('abort', cancel, { once: true });
+    if (options.route) routeRequests.add(controller);
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, options.timeout ?? 10000);
+    try {
+      const res = await fetch(url, { ...init, signal: controller.signal });
+      if (controller.signal.aborted) { const e = new Error('Request canceled'); e.name = 'AbortError'; throw e; }
+      if (!res.ok) {
+        const error = new Error('HTTP request failed');
+        error.status = res.status;
+        throw error;
+      }
+      const json = await res.json();
+      if (controller.signal.aborted) { const e = new Error('Request canceled'); e.name = 'AbortError'; throw e; }
+      return json;
+    } catch (error) {
+      if (timedOut) { const e = new Error('Request deadline exceeded'); e.name = 'TimeoutError'; throw e; }
+      if (controller.signal.aborted) { const e = new Error('Request canceled'); e.name = 'AbortError'; throw e; }
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      parent?.removeEventListener('abort', cancel);
+      routeRequests.delete(controller);
+    }
+  };
+  const diagnosticText = () => JSON.stringify({ application: 'Ravox BR', version: RAVOX_VERSION,
+    page: /^\/watch$/.test(location.pathname) ? 'watch' : location.pathname.startsWith('/results') ? 'search' : 'browse',
+    online: navigator.onLine, issues: issues.slice() }, null, 2);
+  const downloadText = (name, content) => {
+    const url = URL.createObjectURL(new Blob([content], { type: 'application/json;charset=utf-8' }));
+    const a = document.createElement('a'); a.href = url; a.download = name;
+    document.documentElement.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  const recoverNative = (feature, error) => {
+    if (recovering) return;
+    recovering = true;
+    recordIssue(feature, error);
+    cancelRouteRequests();
+    restoreNetwork();
+    try { sessionStorage.setItem('ravox-last-diagnostic', diagnosticText()); } catch (_) {}
+    const url = new URL(location.href);
+    url.searchParams.set('vertice_native', '1');
+    // This parameter bypasses Ravox only in this tab, and prevents reload loops.
+    location.replace(url.href);
+  };
+  const showRequestNotice = (boot = false) => {
+    if (recovering || document.getElementById('ravox-recovery-notice')) return;
+    const issue = latestIssue;
+    if (!boot && !issue) return;
+    const message = issue?.kind === 'session' ? vt('Session expired. Open YouTube to sign in.')
+      : issue?.kind === 'unavailable' ? vt('Content unavailable.')
+        : issue?.kind === 'timeout' ? vt('The connection took too long.')
+          : vt('Could not finish loading.');
+    const box = document.createElement('div'); box.id = 'ravox-recovery-notice';
+    box.setAttribute('role', 'status');
+    Object.assign(box.style, { position: 'fixed', bottom: '20px', right: '20px', zIndex: '2147483647',
+      maxWidth: 'min(420px, 90vw)', padding: '16px', borderRadius: '12px', background: '#181818',
+      color: '#fff', boxShadow: '0 4px 24px #0008', font: '14px system-ui' });
+    const text = document.createElement('p'); text.textContent = message; box.appendChild(text);
+    const action = (label, run) => { const b = document.createElement('button'); b.type = 'button';
+      b.textContent = vt(label); b.style.margin = '4px'; b.addEventListener('click', run); box.appendChild(b); };
+    action('Try again', () => location.reload());
+    action('Open in YouTube', () => recoverNative('manual-recovery', { name: 'Recovery' }));
+    action('Close', () => box.remove());
+    document.documentElement.appendChild(box);
+  };
+
+  // Only preferences belong in a backup: exclude history, account data and caches.
+  const preferenceRules = Object.create(null);
+  const boolKeys = ['itube-audio-only', 'itube-autoplay', 'itube-dislikes', 'itube-hide-watched',
+    'itube-muted', 'itube-rank-balance', 'itube-rank-explain', 'itube-rank-shouty',
+    'itube-reduce-motion', 'itube-skip-sponsors', 'itube-theater', 'itube-time-remaining',
+    'itube-transcript', 'ravox-subscriptions-collapsed', 'vertice-controls', 'vertice-glass', 'ravox-telemetry'];
+  for (const key of boolKeys) preferenceRules[key] = (v) => v === '0' || v === '1';
+  const range = (min, max) => (v) => v.trim() !== '' && Number.isFinite(Number(v)) && Number(v) >= min && Number(v) <= max;
+  preferenceRules['itube-speed'] = range(0.1, 5);
+  preferenceRules['itube-boost'] = range(1, 2);
+  preferenceRules['itube-volume'] = range(0, 100);
+  preferenceRules['itube-theme'] = (v) => ['system','dark','light'].includes(v);
+  preferenceRules['itube-rail'] = (v) => ['collapsed','open'].includes(v);
+  preferenceRules['vertice-language'] = (v) => ['pt-BR','en','es'].includes(v);
+  preferenceRules['itube-quality'] = (v) => ['auto','tiny','small','medium','large','hd720','hd1080','hd1440','hd2160','highres'].includes(v);
+  preferenceRules['ravox-hud-color'] = (v) => /^#[a-f0-9]{6}$/i.test(v);
+  preferenceRules['itube-mute-keywords'] = (v) => { try { const a = JSON.parse(v); return Array.isArray(a) && a.length <= 500 && a.every((x) => typeof x === 'string' && x.length <= 200); } catch (_) { return false; } };
+  preferenceRules['itube-mute-channels'] = (v) => { try { const a = JSON.parse(v); return Array.isArray(a) && a.length <= 500 && a.every((x) => typeof x === 'string' && x.length <= 300 && /^\/(?:@|channel\/|c\/|user\/)/.test(x)); } catch (_) { return false; } };
+  const exportPreferences = () => {
+    const preferences = Object.create(null);
+    for (const [key, valid] of Object.entries(preferenceRules)) { const v = lsGet(key); if (v !== null && valid(v)) preferences[key] = v; }
+    return { application: 'Ravox BR', schema: 1, version: RAVOX_VERSION, preferences };
+  };
+  const validateBackup = (text) => {
+    if (text.length > 262144) throw new Error('Backup too large');
+    const data = JSON.parse(text);
+    if (data?.application !== 'Ravox BR' || data.schema !== 1 || !data.preferences || typeof data.preferences !== 'object' || Array.isArray(data.preferences)) throw new Error('Invalid backup');
+    const values = Object.entries(data.preferences);
+    if (values.some(([k,v]) => !Object.hasOwn(preferenceRules,k) || typeof v !== 'string' || !preferenceRules[k](v))) throw new Error('Invalid preference');
+    return values;
+  };
+  const writePreferences = (values, reset = false) => {
+    const keys = reset ? Object.keys(preferenceRules) : values.map(([k]) => k);
+    const previous = keys.map((key) => [key, localStorage.getItem(key)]);
+    try {
+      if (reset) for (const key of keys) localStorage.removeItem(key);
+      for (const [k,v] of values) localStorage.setItem(k,v);
+    } catch (error) {
+      for (const [k,v] of previous) { try { if (v === null) localStorage.removeItem(k); else localStorage.setItem(k,v); } catch (_) {} }
+      throw error;
+    }
+  };
 
   const verticeLanguages = ['pt-BR', 'en', 'es'];
   const preferredLanguage = lsGet('vertice-language');
   const verticeLanguage = verticeLanguages.includes(preferredLanguage) ? preferredLanguage : 'pt-BR';
   const verticeStrings = {
+    "Block telemetry": ["Bloquear telemetria", "Bloquear telemetría"],
+    "Backup and support": ["Backup e suporte", "Copia y soporte"],
+    "Export settings": ["Exportar configurações", "Exportar ajustes"],
+    "Import settings": ["Importar configurações", "Importar ajustes"],
+    "Restore defaults": ["Restaurar padrões", "Restaurar valores"],
+    "Copy diagnostics": ["Copiar diagnóstico", "Copiar diagnóstico"],
+    "Settings exported.": ["Configurações exportadas.", "Ajustes exportados."],
+    "Restore all Ravox preferences?": ["Restaurar todas as preferências do Ravox?", "¿Restaurar todas las preferencias de Ravox?"],
+    "Diagnostics copied.": ["Diagnóstico copiado.", "Diagnóstico copiado."],
+    "Diagnostics downloaded.": ["Diagnóstico baixado.", "Diagnóstico descargado."],
+    "Could not complete this action.": ["Não foi possível concluir esta ação.", "No se pudo completar esta acción."],
+    "Invalid backup or storage unavailable.": ["Backup inválido ou armazenamento indisponível.", "Copia no válida o almacenamiento no disponible."],
+    "Session expired. Open YouTube to sign in.": ["A sessão expirou. Abra o YouTube para entrar.", "La sesión caducó. Abre YouTube para iniciar sesión."],
+    "Content unavailable.": ["Conteúdo indisponível.", "Contenido no disponible."],
+    "The connection took too long.": ["A conexão demorou demais.", "La conexión tardó demasiado."],
+    "Could not finish loading.": ["Não foi possível concluir o carregamento.", "No se pudo terminar de cargar."],
+
     "Settings": [
       "Configurações",
       "Ajustes"
@@ -752,7 +880,7 @@
   const theaterPref = () => lsGet('itube-theater') === '1';
   const setTheaterPref = (on) => lsSet('itube-theater', on ? '1' : '0');
   const sponsorSkipOn = () => lsGet('itube-skip-sponsors') !== '0';
-  const setSponsorSkipOn = (on) => lsSet('itube-skip-sponsors', on ? '1' : '0');
+  const setSponsorSkipOn = (on) => { lsSet('itube-skip-sponsors', on ? '1' : '0'); window.dispatchEvent(new CustomEvent('ravox-preference-change', { detail: { key: 'itube-skip-sponsors' } })); };
   const dislikesEnabled = () => lsGet('itube-dislikes') !== '0';
   const setDislikesEnabled = (on) => lsSet('itube-dislikes', on ? '1' : '0');
   const transcriptEnabled = () => lsGet('itube-transcript') === '1';
@@ -811,6 +939,41 @@
     return;
   }
 
+  // Neutralize the player's telemetry at the source: answer these with a
+  // fake success instead of letting them reach the network. Quieter than a
+  // content blocker (the player sees "delivered" and never retries — with a
+  // blocker it fails loudly and keeps trying) and it holds for users without
+  // one. Deliberately NOT blocked: /api/stats/watchtime and playback — they
+  // record watch history and resume positions, which are user-facing
+  // features, not telemetry.
+  const TELEMETRY_URL_RE = /doubleclick\.net\/|googlesyndication\.com\/|googleadservices\.com\/|google-analytics\.com\/|\/api\/stats\/(qoe|atr|ads|delayplay)\b|\/ptracking\b|\/youtubei\/v1\/log_event|\/pagead\//;
+  const origFetch = window.fetch;
+  const origBeacon = navigator.sendBeacon;
+  window.fetch = function (input, init) {
+    try {
+      // fetch takes string | URL | Request. A URL object has no `.url`, only
+      // `.href`, so the old `input.url` read undefined for it and every
+      // fetch(new URL(...)) walked straight past this filter. `'url' in input`
+      // rather than `instanceof Request` because it narrows for the checker and
+      // stays duck-typed, so a Request minted in another realm still matches.
+      const url = typeof input === 'string' ? input
+        : input && 'url' in input ? input.url
+        : input ? String(input) : '';
+      if (telemetryEnabled() && TELEMETRY_URL_RE.test(url)) return Promise.resolve(new Response(null, { status: 204 }));
+    } catch (e) {}
+    return origFetch.apply(this, arguments);
+  };
+  if (navigator.sendBeacon) {
+    const sendBeacon = navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon = function (url, data) {
+      try { if (telemetryEnabled() && TELEMETRY_URL_RE.test(String(url))) return true; } catch (e) {}
+      return sendBeacon(url, data);
+    };
+  }
+
+  restoreNetwork = () => { window.fetch = origFetch; if (origBeacon) navigator.sendBeacon = origBeacon; };
+
+  try {
   const CHANNEL_PATH_RE = /^\/(?:@[^/]+|channel\/[^/]+|c\/[^/]+|user\/[^/]+)(?:\/.*)?$/;
   // YouTube's own news destination — both the sidebar's News page and the
   // source of truth for which publishers count as news (see isNewsItem).
@@ -6277,16 +6440,15 @@
     return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
   };
 
-  const innertube = async (endpoint, body) => {
+  const innertube = async (endpoint, body, options = {}) => {
     const c = cfg();
     if (!c?.INNERTUBE_API_KEY) {
-      console.warn('[itube] no INNERTUBE_API_KEY for', endpoint);
+      const e = new Error('Missing client configuration'); recordIssue(endpoint, e);
       return null;
     }
     try {
       const headers = {
-        'content-type': 'application/json',
-        'x-origin': 'https://www.youtube.com',
+        'content-type': 'application/json', 'x-origin': 'https://www.youtube.com',
         'x-goog-authuser': String(c.SESSION_INDEX ?? c.INNERTUBE_CONTEXT?.user?.sessionIndex ?? 0),
       };
       if (c.DELEGATED_SESSION_ID) headers['x-goog-pageid'] = c.DELEGATED_SESSION_ID;
@@ -6294,19 +6456,18 @@
       if (c.INNERTUBE_CONTEXT_CLIENT_VERSION) headers['x-youtube-client-version'] = c.INNERTUBE_CONTEXT_CLIENT_VERSION;
       const auth = await sapisidHash();
       if (auth) headers.authorization = auth;
-      const res = await fetch('/youtubei/v1/' + endpoint + '?key=' + c.INNERTUBE_API_KEY + '&prettyPrint=false', {
-        method: 'POST',
-        credentials: 'include',
-        headers,
+      // Never retry mutations: subscriptions, comments and playlist edits may
+      // have succeeded on the server even when the response was interrupted.
+      const routeBound = ['browse', 'next', 'search', 'navigation/resolve_url'].includes(endpoint);
+      return await requestJson('/youtubei/v1/' + endpoint + '?key=' + c.INNERTUBE_API_KEY + '&prettyPrint=false', {
+        method: 'POST', credentials: 'include', headers,
         body: JSON.stringify({ context: c.INNERTUBE_CONTEXT, ...body }),
-      });
-      if (!res.ok) {
-        console.warn('[itube] innertube ' + endpoint + ' failed: HTTP ' + res.status);
-        return null;
-      }
-      return await res.json();
+      }, { signal: options.signal, route: routeBound, feature: endpoint, timeout: 10000 });
     } catch (e) {
-      console.warn('[itube] innertube ' + endpoint + ' threw', e);
+      if (e.name !== 'AbortError') {
+        recordIssue(endpoint, e);
+        showRequestNotice();
+      }
       return null;
     }
   };
@@ -6329,13 +6490,14 @@
   // parseRelativeTime (en/de/uk/ru).
   /** @type {[RegExp, number][]} */
   const COUNT_SUFFIXES = [
+    [/^milh/i, 1e6], [/^bilh/i, 1e9], [/^mil$/i, 1e3],
     [/^(тыс|тис)/i, 1e3], [/^k/i, 1e3],
     [/^(млн|mio)/i, 1e6], [/^m(?!rd)/i, 1e6],
     [/^(млрд|mrd)/i, 1e9], [/^b/i, 1e9],
   ];
   const parseCount = (text) => {
     if (typeof text !== 'string') return null;
-    const m = text.replace(/\s/g, '').match(/([\d.,]+)(тыс|тис|млн|млрд|Mio|Mrd|[KMB])?\.?/i);
+    const m = text.replace(/\s/g, '').match(/([\d.,]+)(milh(?:ão|ões|ao|oes)|bilh(?:ão|ões|ao|oes)|mil|тыс|тис|млн|млрд|Mio|Mrd|[KMB])?\.?/i);
     if (!m) return null;
     if (m[2]) {
       const n = parseFloat(m[1].replace(',', '.'));
@@ -6352,21 +6514,9 @@
   const fetchDislikes = async (videoId) => {
     if (!dislikesEnabled()) return null;
     try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), RYD_FETCH_TIMEOUT);
-      const res = await fetch('https://returnyoutubedislikeapi.com/votes?videoId=' + encodeURIComponent(videoId), {
-        credentials: 'omit',
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      if (!res.ok) return null;
-      const json = await res.json();
-      if (json?.deleted === true) return null;
-      const dislikes = json?.dislikes;
-      return Number.isFinite(dislikes) ? dislikes : null;
-    } catch (e) {
-      return null;
-    }
+      const json = await requestJson('https://returnyoutubedislikeapi.com/votes?videoId=' + encodeURIComponent(videoId), { credentials: 'omit' }, { timeout: RYD_FETCH_TIMEOUT, route: true, feature: 'dislikes' });
+      return json?.deleted !== true && Number.isFinite(json?.dislikes) ? json.dislikes : null;
+    } catch (e) { if (e.name !== 'AbortError') recordIssue('dislikes', e); return null; }
   };
 
   const AD_KEYS = new Set([
@@ -7408,7 +7558,7 @@
     return el;
   };
 
-  const mutedChannelsSet = () => { try { return new Set(JSON.parse(lsGet('itube-mute-channels') || '[]')); } catch (e) { return new Set(); } };
+  const mutedChannelsSet = () => { try { const v = JSON.parse(lsGet('itube-mute-channels') || '[]'); return new Set(Array.isArray(v) ? v.filter((x) => typeof x === 'string') : []); } catch (e) { return new Set(); } };
   // Array.isArray, not just a parse guard: localStorage is user-writable, and
   // a stored object/number parses fine and then throws on `.includes` /
   // `for…of` at every call site instead of degrading to "no keywords muted".
@@ -7910,10 +8060,12 @@
   let suggestIndex = -1;
   let suggestGeneration = 0;
   let suggestTimer = null;
+  let suggestAbort = null;
 
   const hideSuggestions = () => {
     if (suggestTimer) { clearTimeout(suggestTimer); suggestTimer = null; }
     suggestGeneration++;
+    suggestAbort?.abort();
     suggestEl.classList.remove('show');
     if (suggestUsePopover) { try { suggestEl.hidePopover(); } catch (e) {} }
     suggestEl.replaceChildren();
@@ -7961,10 +8113,11 @@
 
   const fetchSuggestions = async (q) => {
     const gen = ++suggestGeneration;
+    suggestAbort?.abort();
+    const controller = new AbortController();
+    suggestAbort = controller;
     try {
-      const res = await fetch('https://suggestqueries-clients6.youtube.com/complete/search?client=youtube&hl=en&ds=yt&xhr=t&q=' + encodeURIComponent(q), { credentials: 'omit' });
-      if (gen !== suggestGeneration || !res.ok) return;
-      const data = await res.json();
+      const data = await requestJson('https://suggestqueries-clients6.youtube.com/complete/search?client=youtube&hl=' + encodeURIComponent(verticeLanguage) + '&ds=yt&xhr=t&q=' + encodeURIComponent(q), { credentials: 'omit' }, { signal: controller.signal, route: true, feature: 'suggestions' });
       if (gen !== suggestGeneration) return;
       const raw = Array.isArray(data?.[1]) ? data[1] : [];
       const items = raw
@@ -7973,12 +8126,14 @@
         .slice(0, MAX_SUGGESTIONS);
       if (search.value.trim() === q) renderSuggestions(items);
     } catch (e) {
-      console.warn('[itube] search suggestions failed', e);
+      if (e.name !== 'AbortError') recordIssue('suggestions', e);
     }
   };
 
   search.addEventListener('input', () => {
     const q = search.value.trim();
+    suggestGeneration++;
+    suggestAbort?.abort();
     if (suggestTimer) clearTimeout(suggestTimer);
     if (!q) { hideSuggestions(); return; }
     suggestTimer = setTimeout(() => fetchSuggestions(q), SUGGEST_DEBOUNCE_MS);
@@ -8684,6 +8839,8 @@
     (on) => setSponsorSkipOn(on),
   );
   settingsPanel.appendChild(settingsRowEl(vt("Skip sponsors"), skipSponsorsToggle.el));
+  const telemetryToggle = settingsToggle(telemetryEnabled, (on) => lsSet("ravox-telemetry", on ? "1" : "0"));
+  settingsPanel.appendChild(settingsRowEl(vt("Block telemetry"), telemetryToggle.el));
 
   const dislikesToggle = settingsToggle(
     () => dislikesEnabled(),
@@ -8834,6 +8991,50 @@
     shortcutsList.appendChild(row);
   }
   settingsPanel.appendChild(shortcutsList);
+
+  settingsPanel.appendChild(settingsSectionHeading(vt('Backup and support')));
+  const supportStatus = document.createElement('p');
+  supportStatus.setAttribute('role', 'status');
+  supportStatus.style.padding = '0 16px';
+  const supportAction = (label, run) => {
+    const button = document.createElement('button'); button.type = 'button';
+    button.className = 'settings-keyword-add'; button.textContent = vt(label);
+    button.addEventListener('click', () => runPending(button, async () => {
+      try { await run(); } catch (e) { recordIssue('settings', e); supportStatus.textContent = vt('Could not complete this action.'); }
+    }));
+    settingsPanel.appendChild(settingsRowEl(vt(label), button));
+  };
+  supportAction('Export settings', () => {
+    downloadText('RavoxBR-settings.json', JSON.stringify(exportPreferences(), null, 2));
+    supportStatus.textContent = vt('Settings exported.');
+  });
+  const backupInput = document.createElement('input'); backupInput.type = 'file';
+  backupInput.accept = '.json,application/json'; backupInput.hidden = true;
+  settingsPanel.appendChild(backupInput);
+  supportAction('Import settings', () => { backupInput.value = ''; backupInput.click(); });
+  backupInput.addEventListener('change', async () => {
+    const file = backupInput.files?.[0]; if (!file) return;
+    try {
+      if (file.size > 262144) throw new Error('Backup too large');
+      const values = validateBackup(await file.text());
+      writePreferences(values);
+      location.reload();
+    } catch (e) { recordIssue('settings-import', e); supportStatus.textContent = vt('Invalid backup or storage unavailable.'); }
+  });
+  supportAction('Restore defaults', () => {
+    if (!window.confirm(vt('Restore all Ravox preferences?'))) return;
+    writePreferences([], true); location.reload();
+  });
+  supportAction('Copy diagnostics', async () => {
+    const text = diagnosticText();
+    if (navigator.clipboard?.writeText) {
+      try { await navigator.clipboard.writeText(text); supportStatus.textContent = vt('Diagnostics copied.'); return; } catch (_) {}
+    }
+    // Clipboard may be unavailable in some userscript managers or browsers.
+    downloadText('RavoxBR-diagnostics.json', text);
+    supportStatus.textContent = vt('Diagnostics downloaded.');
+  });
+  settingsPanel.appendChild(supportStatus);
 
   const settingsLayout = document.createElement('div');
   settingsLayout.className = 'vertice-settings-layout';
@@ -13126,6 +13327,7 @@
 
     let currentPlaylist = null;
     let renderGeneration = 0;
+    let renderAbort = null;
     let lastNavHandledId = null;
     let firstRelatedId = null;
 
@@ -13672,40 +13874,48 @@
     };
     const SB_CATS = ['sponsor', 'selfpromo', 'interaction'];
     const sbLoad = async (videoId) => {
-      if (!sbEnabled) return;
-      if (!videoId || videoId === sbVideoId) return;
+      if (!sbEnabled || !videoId || videoId === sbVideoId) return;
       sbVideoId = videoId;
       sbSegments = [];
+      sbAbort?.abort();
       renderSbMarkers();
       if (sbCache.has(videoId)) { sbSegments = sbCache.get(videoId); renderSbMarkers(); return; }
+      const controller = new AbortController();
+      sbAbort = controller;
       try {
-        if (sbAbort) sbAbort.abort();
-        sbAbort = new AbortController();
-        const to = setTimeout(() => sbAbort.abort(), 5000);
         const prefix = (await sha256Hex(videoId)).slice(0, 4);
+        if (controller.signal.aborted || sbVideoId !== videoId) return;
         const url = 'https://sponsor.ajay.app/api/skipSegments/' + prefix + '?categories=' + encodeURIComponent(JSON.stringify(SB_CATS)) + '&actionType=skip';
-        const res = await fetch(url, { credentials: 'omit', signal: sbAbort.signal });
-        clearTimeout(to);
-        if (!res.ok) { sbCacheSet(videoId, []); return; }
-        const data = await res.json();
-        if (sbVideoId !== videoId) return;
+        const data = await requestJson(url, { credentials: 'omit' }, { signal: controller.signal, timeout: 5000, route: true, feature: 'sponsorblock' });
+        if (controller.signal.aborted || sbVideoId !== videoId) return;
         const segs = [];
         if (Array.isArray(data)) {
           for (const entry of data) {
-            if (!entry || entry.videoID !== videoId || !Array.isArray(entry.segments)) continue;
+            if (entry?.videoID !== videoId || !Array.isArray(entry.segments)) continue;
             for (const s of entry.segments) {
-              if (s && s.actionType === 'skip' && Array.isArray(s.segment) && s.segment.length === 2) {
-                segs.push({ start: +s.segment[0], end: +s.segment[1], category: s.category });
-              }
+              if (s?.actionType !== 'skip' || !Array.isArray(s.segment) || s.segment.length !== 2) continue;
+              const [start, end] = s.segment;
+              if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start || !SB_CATS.includes(s.category)) continue;
+              segs.push({ start, end, category: s.category });
             }
           }
         }
-        segs.sort((a, b) => a.start - b.start);
+        segs.sort((a,b) => a.start - b.start);
         sbCacheSet(videoId, segs);
         sbSegments = segs;
         renderSbMarkers();
-      } catch (e) {}
+      } catch (e) {
+        if (e.status === 404 && sbVideoId === videoId) sbCacheSet(videoId, []);
+        else if (e.name !== 'AbortError') {
+          recordIssue('sponsorblock', e);
+          // A transient failure should be retryable after a short cooldown.
+          setTimeout(() => { if (!mountAbort.signal.aborted && sbVideoId === videoId) sbVideoId = null; }, 15000);
+        }
+      } finally {
+        if (sbAbort === controller) sbAbort = null;
+      }
     };
+
     const SB_COLORS = { sponsor: '#00d46a', selfpromo: '#ffd000', interaction: '#c14bff' };
     // adActive, like renderTicks: during an ad the <video>'s duration is the
     // AD's (~20s) while sbSegments still hold content timestamps (up to hours),
@@ -13742,6 +13952,15 @@
         }
       }
     };
+    window.addEventListener('ravox-preference-change', (event) => {
+      if (event.detail?.key !== 'itube-skip-sponsors') return;
+      sbEnabled = sponsorSkipOn();
+      if (!sbEnabled) {
+        sbAbort?.abort(); sbVideoId = null; sbSegments = []; renderSbMarkers();
+      } else {
+        const id = player()?.getVideoData?.()?.video_id; if (id) sbLoad(id);
+      }
+    }, bound);
     let desiredRate = (() => { const v = parseFloat(lsGet('itube-speed')); return v >= 0.1 && v <= 5 ? v : 1; })();
     const applyRate = (rate) => {
       rate = Math.min(5, Math.max(0.1, rate));
@@ -14502,7 +14721,7 @@
           }
         }
       };
-      video.addEventListener('timeupdate', paintPosition, bound);
+      video.addEventListener('timeupdate', () => { paintPosition(); if (!adActive) sbSkipCheck(video); }, bound);
       video.addEventListener('seeking', paintPosition, bound);
       video.addEventListener('seeked', paintPosition, bound);
       video.addEventListener('durationchange', () => {
@@ -14687,7 +14906,8 @@
         if (storedMuted || adActive) p.mute?.(); else p.unMute?.();
       };
       applyVolume();
-      setTimeout(applyVolume, 800);
+      const restoreVolumeTimer = setTimeout(applyVolume, 800);
+      mountAbort.signal.addEventListener("abort", () => { clearTimeout(restoreVolumeTimer); clearTimeout(saveTimer); }, { once: true });
 
       if (ui) {
         ui.vol.value = storedMuted ? 0 : initialVol;
@@ -14712,7 +14932,19 @@
       applyBoost(video);
     };
     tick();
-    const timer = setInterval(tick, 500);
+    const requestTick = () => {
+      if (tickFrame || mountAbort.signal.aborted) return;
+      tickFrame = requestAnimationFrame(() => { tickFrame = 0; tick(); });
+    };
+    let tickFrame = 0;
+    for (const eventName of ['loadedmetadata', 'durationchange', 'play', 'pause', 'emptied']) {
+      stage.addEventListener(eventName, requestTick, { capture: true, signal: mountAbort.signal });
+    }
+    const timer = setInterval(() => {
+      const video = stage.querySelector('video');
+      const active = document.visibilityState === 'visible' || (video && !video.paused);
+      if (active) tick();
+    }, 1000);
 
     const finishMiniHandoff = () => {
       if (!miniFlying) return;
@@ -14953,6 +15185,7 @@
     window.addEventListener('keydown', onKeydown, true);
 
     const onVisibility = () => {
+      if (document.visibilityState === 'visible') requestTick();
       if (boostCtx && document.visibilityState === 'visible' && boostCtx.state === 'suspended') boostCtx.resume().catch(() => {});
       if (audioOnly && document.visibilityState === 'hidden') {
         const v = stage.querySelector('video');
@@ -14963,6 +15196,9 @@
 
     const renderWatchFor = async (videoId, seedTitle) => {
       const gen = ++renderGeneration;
+      renderAbort?.abort();
+      const controller = new AbortController();
+      renderAbort = controller;
       lastNavHandledId = videoId;
       descPopupWire.close();
       transcriptPopupWire.close();
@@ -14975,9 +15211,9 @@
       // the URL — updateQueue used to refetch the same 1–2MB endpoint just to
       // get the panel.
       const listId = new URLSearchParams(location.search).get('list');
-      const data = await innertube('next', listId ? { videoId, playlistId: listId } : { videoId });
+      const data = await innertube('next', listId ? { videoId, playlistId: listId } : { videoId }, { signal: controller.signal });
       if (gen !== renderGeneration) return;
-      if (!data) { hideMetaSkeletonImmediate(); return; }
+      if (!data) { hideMetaSkeletonImmediate(); showRequestNotice(); return; }
       chapters = parseChapters(data);
       renderMeta(data);
       renderTicks();
@@ -14993,9 +15229,13 @@
     }
 
     return () => {
+      renderGeneration++;
+      renderAbort?.abort();
+      delete window.__ravoxWatchState;
       if (stopGuideWait) { stopGuideWait(); stopGuideWait = null; }
       if (miniFlying && miniFlyCancel) miniFlyCancel();
       clearInterval(timer);
+      cancelAnimationFrame(tickFrame);
       mountAbort.abort();
       if (sbAbort) sbAbort.abort();
       sbSegments = [];
@@ -15350,6 +15590,7 @@
   };
 
   const route = () => {
+    try {
     const isPop = popNav;
     popNav = false;
     if (NATIVE_ROUTE_RE.test(location.pathname)) { location.reload(); return; }
@@ -15369,6 +15610,7 @@
     if (type !== 'watch') stopWatchBoot();
 
     const key = keyFor(type, path, location.search);
+    if (key !== currentKey) cancelRouteRequests();
     if (type === 'watch' && watchApi) {
       const wantId = new URLSearchParams(location.search).get('v');
       const playingId = player()?.getVideoData?.()?.video_id;
@@ -15418,6 +15660,7 @@
       : type === 'playlists' ? mountPlaylists(cacheEntry)
       : mountUnhandled();
     spaNav = false;
+    } catch (e) { recoverNative('navigation', e); }
   };
 
   // Dormant only when Ravox BR is definitely not using YouTube's player.
@@ -15563,10 +15806,11 @@
       finishBoot();
     }
   }, 80);
-  const bootFallback = setTimeout(finishBoot, 8000);
+  const bootFallback = setTimeout(() => { finishBoot(); showRequestNotice(true); }, 8000);
 
   route();
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', syncAccount, { once: true });
   }
+  } catch (e) { recoverNative('startup', e); }
 })();
